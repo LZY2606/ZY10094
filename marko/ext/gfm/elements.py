@@ -9,7 +9,7 @@ import re
 from typing import Any, cast
 
 from marko import block, inline
-from marko.element import _SourceMap
+from marko.sourcemap import SourceMap, Span
 from marko.source import Source
 
 
@@ -23,8 +23,8 @@ class Paragraph(block.Paragraph):
         if m:
             self.checked = m.group(1)[1:-1].lower() == "x"
             self.inline_body = self.inline_body[m.end(1) :]
-            if self._inline_positions is not None:
-                self._inline_positions = self._inline_positions[m.end(1) :]
+            if self._inline_body_map is not None:
+                self._inline_body_map = self._inline_body_map[m.end(1) :]
 
 
 class Strikethrough(inline.InlineElement):
@@ -134,11 +134,11 @@ class Table(block.BlockElement):
         source.pos = source.match.end()
         head = TableRow(
             [
-                TableCell(cell, start)
+                TableCell(cell, start if source.sourcemap else None)
                 for cell, start in zip(source.context.cells, source.context.cell_starts)
             ]
         )
-        head.source_span = head_span
+        source.set_span(head, head_span)
         if (
             not TableRow.match(source)
             or not source.context.is_delimiter
@@ -179,7 +179,7 @@ class Table(block.BlockElement):
                         rv.children.append(TableRow.parse(source))
                         continue
                 break
-        rv.source_span = (table_start, source.pos)
+        source.set_span(rv, (table_start, source.pos))
         return rv
 
 
@@ -229,7 +229,9 @@ class TableRow(block.BlockElement):
         source.consume()
         parent = cast(Table, source.state)
         cells: list[str] = source.context.cells[:]
-        starts: list[int | None] = source.context.cell_starts[:]
+        starts: list[int | None] = (
+            source.context.cell_starts[:] if source.sourcemap else []
+        )
         if len(cells) < parent.num_of_cols:
             pad = parent.num_of_cols - len(cells)
             cells.extend("" for _ in range(pad))
@@ -237,11 +239,13 @@ class TableRow(block.BlockElement):
         elif len(cells) > parent.num_of_cols:
             cells = cells[: parent.num_of_cols]
             starts = starts[: parent.num_of_cols]
+        if not source.sourcemap:
+            starts = [None] * len(cells)
         cell_elements = [TableCell(cell, start) for cell, start in zip(cells, starts)]
         for head, cell in zip(parent.head.children, cell_elements):
             cell.align = cast(TableCell, head).align
         rv = cls(cell_elements)
-        rv.source_span = source.context.row_span
+        source.set_span(rv, source.context.row_span)
         return rv
 
 
@@ -256,17 +260,29 @@ class TableCell(block.BlockElement):
         self.header = False
         self.align: str | None = None
         if position is not None:
-            self.source_span = (position, position + len(text))
+            self.source_span = Span(position, position + len(text))
             pos = position + (len(text) - len(text.lstrip()))
-            self._inline_positions = _SourceMap.from_positions(
-                pos + i
-                for i in range(len(stripped))
-                if not (
+            runs: list[tuple[int, int]] = []
+            run_start = 0
+            i = 0
+            while i < len(stripped):
+                if (
                     stripped[i] == "\\"
                     and i + 1 < len(stripped)
                     and stripped[i + 1] == "|"
-                )
-            )
+                ):
+                    if i > run_start:
+                        runs.append((pos + run_start, i - run_start))
+                    # the escaped pipe occupies one body position ("|")
+                    # mapped onto the source "|" character
+                    runs.append((pos + i + 1, 1))
+                    i += 2
+                    run_start = i
+                else:
+                    i += 1
+            if run_start < len(stripped):
+                runs.append((pos + run_start, len(stripped) - run_start))
+            self._inline_body_map = SourceMap(runs)
 
 
 class Alert(block.Quote):

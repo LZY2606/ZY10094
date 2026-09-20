@@ -43,6 +43,9 @@ class Markdown:
     :param renderer: a subclass of :class:`marko.renderer.Renderer`.
     :param extensions: a list of extensions to register on the object.
         See document of :meth:`Markdown.use()`.
+    :param sourcemap: when False (default True), parsing allocates no
+        source position objects; every ``source_span``/``syntax_spans``
+        stays None and rendering output is identical.
 
     .. note::
         This class is not thread-safe. Create a new instance for each thread.
@@ -53,11 +56,14 @@ class Markdown:
         parser: type[Parser] = Parser,
         renderer: type[Renderer] = HTMLRenderer,
         extensions: Iterable[str | MarkoExtension] | None = None,
+        sourcemap: bool = True,
     ) -> None:
         if not issubclass(parser, Parser):
             raise TypeError("parser must be a subclass of Parser.")
         self._base_parser = parser
         self._parser_mixins: list[type] = []
+        #: When False, parsing produces no position (span) allocations.
+        self.sourcemap = sourcemap
 
         if not issubclass(renderer, Renderer):
             raise TypeError("renderer must be a subclass of Renderer.")
@@ -94,10 +100,10 @@ class Markdown:
         """Install all extensions and set things up."""
         if self._setup_done:
             return
-        self.parser = cast(
-            Parser,
-            type("_Parser", tuple(self._parser_mixins) + (self._base_parser,), {})(),
+        parser_cls = type(
+            "_Parser", tuple(self._parser_mixins) + (self._base_parser,), {}
         )
+        self.parser = cast(Parser, parser_cls(sourcemap=self.sourcemap))
         for e in self._extra_elements:
             self.parser.add_element(e)
         self.renderer = cast(

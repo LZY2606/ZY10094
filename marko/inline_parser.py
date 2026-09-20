@@ -181,16 +181,35 @@ class Token:
 
     def as_element(self) -> InlineElement:
         e = self.etype(self.match)
-        e.source_span = _translate_span(self.positions, self.start, self.end)
-        syntax_spans = e._syntax_spans(self.match)
-        if self.positions is not None and syntax_spans:
-            translated = []
-            for start, end in syntax_spans:
-                span = _translate_span(self.positions, start, end)
-                if span is not None:
-                    translated.append(span)
-            e.syntax_spans = translated
-        e._set_extra_source_spans(self.match, self.positions)
+        # This is the single point where inline elements receive their
+        # spans: the enclosing source span, the syntax fragments and any
+        # element-specific spans (link destination/title) all come from the
+        # same compact position mapping. Without a mapping (third-party
+        # extensions that do not provide positions) the element simply
+        # stays span-less and is still fully usable by renderers.
+        e.source_span = (
+            _translate_span(self.positions, self.start, self.end)
+            if self.positions is not None
+            else None
+        )
+        # A misbehaving extension hook (bad match offsets, ...) must only
+        # lose the extra spans for that element, never break the parse.
+        try:
+            if self.positions is not None:
+                syntax_spans = e._syntax_spans(self.match)
+                if syntax_spans:
+                    e.syntax_spans = [
+                        span
+                        for start, end in syntax_spans
+                        if (span := _translate_span(self.positions, start, end))
+                        is not None
+                    ]
+            e._set_extra_source_spans(self.match, self.positions)
+        except (IndexError, ValueError, TypeError):
+            e.syntax_spans = None
+            for attr in ("dest_span", "title_span"):
+                if hasattr(e, attr):
+                    setattr(e, attr, None)
         if e.parse_children:
             self.children = _resolve_overlap(self.children)
             e.children = make_elements(

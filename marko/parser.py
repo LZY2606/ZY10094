@@ -8,7 +8,28 @@ import itertools
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
+from .element import Element
 from .source import Source
+
+
+def _strip_position_data(node: Element) -> None:
+    """Remove every position allocation produced while source maps were
+    off. Some built-in constructors (e.g. Heading) build their inline
+    mapping eagerly; this is the single cleanup point."""
+    node._source_span = None
+    node._syntax_span_data = None
+    node._inline_body_map = None
+    for attr in ("dest_span", "title_span"):
+        if hasattr(node, attr):
+            try:
+                setattr(node, attr, None)
+            except Exception:
+                pass
+    children = getattr(node, "children", None)
+    if isinstance(children, (list, tuple)):
+        for child in children:
+            if isinstance(child, Element):
+                _strip_position_data(child)
 
 
 class Parser:
@@ -23,7 +44,9 @@ class Parser:
     :param \*extras: extra elements to be included in parsing process.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, sourcemap: bool = True) -> None:
+        #: When False, parsing never allocates position (span) objects.
+        self.sourcemap = sourcemap
         self.block_elements: dict[str, BlockElementType] = {}
         self.inline_elements: dict[str, InlineElementType] = {}
 
@@ -59,10 +82,13 @@ class Parser:
         :param text: the text to parse.
         :returns: the parsed root element
         """
-        source = Source(text)
+        source = Source(text, sourcemap=self.sourcemap)
+
         source.parser = self
         doc = cast(block.Document, self.block_elements["Document"]())
-        doc.source_span = (0, len(source._buffer))
+        if self.sourcemap:
+            doc.source_span = (0, len(source._buffer))
+            doc.crlf_newlines = source.crlf_newlines
         with source.under_state(doc):
             doc.children = self.parse_source(source)
             self.parse_inline(doc, source)
@@ -83,8 +109,15 @@ class Parser:
                         # instead some information to create one, which will be passed
                         # to ``__init__()``.
                         result = ele_type(result)  # type: ignore
-                    if result.source_span is None:
-                        result.source_span = (start, end)
+                    # This is the single point where blocks receive their span.
+                    # Extensions that set their own span keep it; third-party
+                    # elements without position data stay span-less only when
+                    # source maps are disabled.
+                    if source.sourcemap:
+                        if result.source_span is None:
+                            result.source_span = (start, end)
+                    else:
+                        _strip_position_data(result)
                     ast.append(result)
                     break
             else:
@@ -97,14 +130,19 @@ class Parser:
         are seen before that.
         """
         if element.inline_body:
+            if source.sourcemap and element._inline_body_map is None:
+                builder = getattr(element, "_ensure_inline_map", None)
+                if builder is not None:
+                    builder()
+            positions = element._inline_body_map if source.sourcemap else None
             element.children = self._parse_inline(
                 element.inline_body,
                 source,
-                positions=element._inline_positions,
+                positions=positions,
             )
             # clear the inline body to avoid parsing it again.
             element.inline_body = ""
-            element._inline_positions = None
+            element._inline_body_map = None
         else:
             for child in element.children:
                 if isinstance(child, block.BlockElement):

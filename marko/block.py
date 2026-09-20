@@ -10,7 +10,8 @@ from re import Match
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from . import inline, inline_parser, patterns
-from .element import Element, _SourceMap
+from .element import Element
+from .sourcemap import SourceMap, Span, span_to_raw
 from .helpers import find_next, normalize_label, partition_by_spaces
 
 if TYPE_CHECKING:
@@ -81,32 +82,49 @@ class Document(BlockElement):
     _prefix = ""
     virtual = True
 
+    #: Normalized offsets of newlines that came from collapsing ``\r\n``.
+    crlf_newlines: tuple[int, ...] = ()
+
     def __init__(self) -> None:
         self.children = []
         self.link_ref_defs: dict[str, tuple[str, str]] = {}
 
+    def to_raw_span(self, span: Span | tuple[int, int]) -> Span:
+        """Translate a normalized-text span to offsets in the original text.
+
+        A no-op when the input did not contain ``\r\n``. The returned span
+        keeps exact runs for discontinuous regions.
+        """
+        return span_to_raw(span, self.crlf_newlines)
+
+    def to_raw_offset(self, offset: int) -> int:
+        """Translate one normalized-text offset to the original text."""
+        return self.to_raw_span((offset, offset + 1)).start
+
 
 class _ParsedLines(list[str]):
-    """Paragraph lines with their prefix-aware source offsets."""
+    """Paragraph lines with their prefix-aware source offsets.
 
-    def __init__(self, lines: Sequence[str], line_starts: Sequence[int]) -> None:
+    ``line_starts=None`` means positions are unavailable (third-party
+    constructor or source maps disabled); an empty list means the
+    paragraph legitimately has no positioned lines yet.
+    """
+
+    def __init__(
+        self,
+        lines: Sequence[str],
+        line_starts: Sequence[int] | None,
+    ) -> None:
         super().__init__(lines)
-        self.line_starts = list(line_starts)
+        self.line_starts = None if line_starts is None else list(line_starts)
 
 
 def _build_inline_positions(
-    lines: Sequence[str], line_starts: Sequence[int]
-) -> _SourceMap:
-    """Build a parallel mapping from the indices of the inline body
-    (i.e. the lines with leading whitespace stripped and joined) to the
-    positions in the source text.
-    """
-    runs: list[tuple[int, int]] = []
-    for line, base in zip(lines, line_starts):
-        stripped = line.lstrip()
-        leading = len(line) - len(stripped)
-        runs.append((base + leading, len(stripped)))
-    return _SourceMap(runs)
+    lines: Sequence[str], line_starts: Sequence[int], trailing: int = 0
+) -> SourceMap:
+    """Build the compact mapping of an inline body (the lines with leading
+    whitespace stripped and joined) to source positions."""
+    return SourceMap.from_lines(lines, line_starts, trailing)
 
 
 class BlankLine(BlockElement):
@@ -152,17 +170,31 @@ class Heading(BlockElement):
         b = len(group)
         while b > a and group[b - 1].isspace():
             b -= 1
-        self._inline_positions = _SourceMap([(start + a, b - a)])
-
-    @classmethod
-    def match(cls, source: Source) -> Match[str] | None:
-        return source.expect_re(cls.pattern)
+        # Remember where the trimmed inline body starts; its compact
+        # mapping is built lazily by _ensure_inline_map so that no
+        # position object is allocated when source maps are disabled.
+        self._inline_body_start = start + a
+        self._inline_body_end = start + b
 
     @classmethod
     def parse(cls, source: Source) -> Match[str] | None:
         m = source.match
         source.consume()
         return m
+
+    def _ensure_inline_map(self) -> None:
+        self._inline_body_map = SourceMap(
+            [
+                (
+                    self._inline_body_start,
+                    self._inline_body_end - self._inline_body_start,
+                )
+            ]
+        )
+
+    @classmethod
+    def match(cls, source: Source) -> Match[str] | None:
+        return source.expect_re(cls.pattern)
 
 
 class SetextHeading(BlockElement):
@@ -179,7 +211,7 @@ class SetextHeading(BlockElement):
         self.level = 1 if underline.strip()[0] == "=" else 2
         self.inline_body = "".join(line.lstrip() for line in lines).strip()
         if line_starts is not None:
-            self._inline_positions = _build_inline_positions(
+            self._inline_body_map = _build_inline_positions(
                 lines, line_starts[: len(lines)]
             )[: len(self.inline_body)]
 
@@ -390,7 +422,7 @@ class Paragraph(BlockElement):
         self._tight = False
         line_starts = getattr(lines, "line_starts", None)
         if line_starts is not None:
-            self._inline_positions = _build_inline_positions(lines, line_starts)[
+            self._inline_body_map = _build_inline_positions(lines, line_starts)[
                 : len(str_lines)
             ]
 
@@ -442,7 +474,9 @@ class Paragraph(BlockElement):
         assert first_line is not None
         lines = _ParsedLines(
             [first_line],
-            [source.match.start() if source.match else source.pos],
+            [source.match.start() if source.match else source.pos]
+            if source.sourcemap
+            else None,
         )
         source.consume()
         end_parse = False
@@ -453,9 +487,11 @@ class Paragraph(BlockElement):
             # the prefix is matched and not breakers
             if line:
                 lines.append(line)
-                lines.line_starts.append(
-                    source.match.start() if source.match else source.pos
-                )
+                if source.sourcemap:
+                    assert lines.line_starts is not None
+                    lines.line_starts.append(
+                        source.match.start() if source.match else source.pos
+                    )
                 source.consume()
                 if cls.is_setext_heading(line):
                     return cast(
@@ -475,9 +511,13 @@ class Paragraph(BlockElement):
                             end_parse = True
                         else:
                             lines.append(next_line)
-                            lines.line_starts.append(
-                                source.match.start() if source.match else source.pos
-                            )
+                            if source.sourcemap:
+                                assert lines.line_starts is not None
+                                lines.line_starts.append(
+                                    source.match.start()
+                                    if source.match
+                                    else source.pos
+                                )
                             source.consume()
                         break
                 source._states = states
@@ -547,7 +587,8 @@ class List(BlockElement):
                         el = cast("type[ListItem]", parser.block_elements["ListItem"])(
                             el
                         )
-                    el.source_span = (item_start, source.pos)
+                    if source.sourcemap:
+                        el.source_span = (item_start, source.pos)
                     children.append(el)
                     source.anchor()
                     if has_blank_line:

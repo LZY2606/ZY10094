@@ -16,10 +16,37 @@ if TYPE_CHECKING:
     from marko.parser import Parser
 
 
-def _preprocess_text(text: str) -> str:
-    # Normalize line terminators so block parsers can always advance on line reads.
-    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\f", "\n")
-    return text.replace("\x00", "�")
+def _preprocess_text(text: str) -> tuple[str, tuple[int, ...]]:
+    """Normalize line terminators so block parsers can always advance on
+    line reads, and record where ``\r\n`` pairs collapsed into ``\n``.
+
+    Only ``\r\n`` changes the text length, so only those newlines shift
+    offsets between the original and normalized texts. The returned tuple
+    holds their normalized offsets (sorted).
+    """
+    crlf_newlines: list[int] = []
+    result: list[str] = []
+    i = 0
+    length = len(text)
+    while i < length:
+        char = text[i]
+        if char == "\r":
+            result.append("\n")
+            if i + 1 < length and text[i + 1] == "\n":
+                crlf_newlines.append(len(result) - 1)
+                i += 2
+            else:
+                i += 1
+        elif char == "\f":
+            result.append("\n")
+            i += 1
+        elif char == "\x00":
+            result.append("�")
+            i += 1
+        else:
+            result.append(char)
+            i += 1
+    return "".join(result), tuple(crlf_newlines)
 
 
 class Source:
@@ -27,8 +54,10 @@ class Source:
 
     parser: Parser
 
-    def __init__(self, text: str) -> None:
-        self._buffer = _preprocess_text(text)
+    def __init__(self, text: str, sourcemap: bool = True) -> None:
+        self._buffer, self.crlf_newlines = _preprocess_text(text)
+        #: Whether the parser should allocate source position information.
+        self.sourcemap = sourcemap
         self.pos = 0
         self._anchor = 0
         self._states: list[BlockElement] = []
@@ -160,6 +189,19 @@ class Source:
     def anchor(self) -> None:
         """Pin the current parsing position."""
         self._anchor = self.pos
+
+    def set_span(
+        self, element: BlockElement, span: tuple[int, int]
+    ) -> tuple[int, int] | None:
+        """Attach a source span to ``element`` through the single shared
+        path. Returns the span when source maps are enabled and ``None``
+        otherwise, so callers can pass the result straight to an
+        assignment without allocating anything when disabled.
+        """
+        if self.sourcemap:
+            element.source_span = span
+            return span
+        return None
 
     def reset(self) -> None:
         """Reset the position to the last anchor."""
