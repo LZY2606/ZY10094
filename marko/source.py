@@ -9,6 +9,7 @@ from re import Match, Pattern
 from typing import TYPE_CHECKING, cast, overload
 
 from marko.block import BlockElement, Document
+from marko.span import NewlineMap
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -16,10 +17,14 @@ if TYPE_CHECKING:
     from marko.parser import Parser
 
 
-def _preprocess_text(text: str) -> str:
+def _normalize_line_terminators(text: str) -> str:
     # Normalize line terminators so block parsers can always advance on line reads.
-    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\f", "\n")
-    return text.replace("\x00", "�")
+    return (
+        text.replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\f", "\n")
+        .replace("\x00", "�")
+    )
 
 
 class Source:
@@ -27,8 +32,17 @@ class Source:
 
     parser: Parser
 
-    def __init__(self, text: str) -> None:
-        self._buffer = _preprocess_text(text)
+    def __init__(self, text: str, *, sourcemap: bool = True) -> None:
+        self.raw_text = text if sourcemap else None
+        normalized = _normalize_line_terminators(text)
+        self._buffer = normalized
+        #: Compact record of the ``\r\n`` endings, used to expose raw offsets.
+        #: Shared empty tuple when source maps are disabled so nothing extra
+        #: is allocated per parse.
+        self.newline_map = (
+            NewlineMap.build(text, normalized) if sourcemap else _EMPTY_NEWLINES
+        )
+        self.sourcemap_enabled = sourcemap
         self.pos = 0
         self._anchor = 0
         self._states: list[BlockElement] = []
@@ -169,3 +183,6 @@ class Source:
         for s in self._states:
             if hasattr(s, "_second_prefix"):
                 s._prefix = s._second_prefix
+
+
+_EMPTY_NEWLINES = NewlineMap(())

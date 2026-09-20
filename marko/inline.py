@@ -5,14 +5,17 @@ Inline(span) level elements
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from re import Pattern
 from typing import TYPE_CHECKING
 
 from . import patterns
-from .element import Element, _translate_span
+from .element import Element
+from .span import SourceMap
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from .inline_parser import _Match
     from .source import Source
 
@@ -79,7 +82,7 @@ class InlineElement(Element):
         return None
 
     def _set_extra_source_spans(
-        self, match: _Match, positions: Sequence[int] | None
+        self, match: _Match, positions: SourceMap | None
     ) -> None:
         """A hook to set additional source position attributes (e.g. the
         destination span of a link) on the element. Called by the inline
@@ -177,10 +180,12 @@ class Link(InlineElement):
         self.title_span: tuple[int, int] | None = None
 
     def _set_extra_source_spans(
-        self, match: _Match, positions: Sequence[int] | None
+        self, match: _Match, positions: SourceMap | None
     ) -> None:
-        self.dest_span = _translate_span(positions, match.start(2), match.end(2))
-        self.title_span = _translate_span(positions, match.start(3), match.end(3))
+        if positions is None:
+            return
+        self.dest_span = positions.translate(match.start(2), match.end(2))
+        self.title_span = positions.translate(match.start(3), match.end(3))
 
 
 class Image(InlineElement):
@@ -202,10 +207,12 @@ class Image(InlineElement):
         self.title_span: tuple[int, int] | None = None
 
     def _set_extra_source_spans(
-        self, match: _Match, positions: Sequence[int] | None
+        self, match: _Match, positions: SourceMap | None
     ) -> None:
-        self.dest_span = _translate_span(positions, match.start(2), match.end(2))
-        self.title_span = _translate_span(positions, match.start(3), match.end(3))
+        if positions is None:
+            return
+        self.dest_span = positions.translate(match.start(2), match.end(2))
+        self.title_span = positions.translate(match.start(3), match.end(3))
 
 
 class CodeSpan(InlineElement):
@@ -248,11 +255,13 @@ class AutoLink(InlineElement):
         ]
 
     def _set_extra_source_spans(
-        self, match: _Match, positions: Sequence[int] | None
+        self, match: _Match, positions: SourceMap | None
     ) -> None:
+        if positions is None:
+            return
         child = self.children[0]
         if isinstance(child, Element):
-            child.source_span = _translate_span(positions, match.start(1), match.end(1))
+            child.source_span = positions.translate(match.start(1), match.end(1))
 
 
 class RawText(InlineElement):

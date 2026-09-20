@@ -17,6 +17,9 @@ if TYPE_CHECKING:
     from marko import inline
     from marko.element import Element
 
+#: Position metadata is parser bookkeeping, not part of the rendered AST.
+_POSITION_ATTRS = frozenset(("span_info", "dest_span", "title_span"))
+
 
 class ASTRenderer(Renderer):
     """Render as AST structure.
@@ -56,7 +59,11 @@ class ASTRenderer(Renderer):
             return [self.render(e) for e in element]
         if isinstance(element, str):
             return element
-        rv = {k: v for k, v in element.__dict__.items() if not k.startswith("_")}
+        rv = {
+            k: v
+            for k, v in element.__dict__.items()
+            if not k.startswith("_") and k not in _POSITION_ATTRS
+        }
         if "children" in rv:
             rv["children"] = self.render(rv["children"])
         rv["element"] = camel_to_snake_case(element.__class__.__name__)
@@ -101,7 +108,9 @@ class XMLRenderer(Renderer):
         attrs = {
             k: v
             for k, v in element.__dict__.items()
-            if not k.startswith("_") and k not in ("body", "children")
+            if not k.startswith("_")
+            and k not in ("body", "children")
+            and k not in _POSITION_ATTRS
         }
         attr_str = "".join(f' {k}="{v}"' for k, v in attrs.items())
         element_name = camel_to_snake_case(element.__class__.__name__)

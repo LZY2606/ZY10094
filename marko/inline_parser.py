@@ -5,14 +5,13 @@ Parse inline elements
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
 from re import Match
 from typing import TYPE_CHECKING, NamedTuple, Union
 
 from . import patterns
-from .element import _translate_span
 from .helpers import find_next, is_paired, normalize_label
 from .inline import InlineElement
+from .span import SourceMap, Span, make_location
 
 if TYPE_CHECKING:
     from .source import Source
@@ -42,7 +41,7 @@ def parse(
     elements: list[ElementType],
     fallback: ElementType,
     source: Source,
-    positions: Sequence[int] | None = None,
+    positions: SourceMap | None = None,
 ) -> list[InlineElement]:
     """Parse given text and produce a list of inline elements.
 
@@ -100,7 +99,7 @@ def make_elements(
     start: int = 0,
     end: int | None = None,
     fallback: ElementType | None = None,
-    positions: Sequence[int] | None = None,
+    positions: SourceMap | None = None,
 ) -> list[InlineElement]:
     """Make elements from a list of parsed tokens.
     It will turn all unmatched holes into fallback elements.
@@ -120,15 +119,36 @@ def make_elements(
     for token in tokens:
         if prev_end < token.start:
             rv = fallback(text[prev_end : token.start])  # type: ignore
-            rv.source_span = _translate_span(positions, prev_end, token.start)
+            _attach_fallback_span(rv, positions, prev_end, token.start)
             result.append(rv)
         result.append(token.as_element())
         prev_end = token.end
     if prev_end < end:
         rv = fallback(text[prev_end:end])  # type: ignore
-        rv.source_span = _translate_span(positions, prev_end, end)
+        _attach_fallback_span(rv, positions, prev_end, end)
         result.append(rv)
     return result
+
+
+def _attach_fallback_span(
+    element: InlineElement,
+    positions: SourceMap | None,
+    start: int,
+    end: int,
+) -> None:
+    """Attach a content span to a fallback RawText element, degrading to no
+    position when the extension-provided element rejects span assignment."""
+    if positions is None:
+        return
+    try:
+        span = positions.translate(start, end)
+    except Exception:
+        return
+    if span is not None:
+        try:
+            element.source_span = span
+        except Exception:
+            pass
 
 
 class Token:
@@ -147,7 +167,7 @@ class Token:
         match: _Match,
         text: str,
         fallback: ElementType,
-        positions: Sequence[int] | None = None,
+        positions: SourceMap | None = None,
     ) -> None:
         self.etype = etype
         self.match = match
@@ -181,16 +201,14 @@ class Token:
 
     def as_element(self) -> InlineElement:
         e = self.etype(self.match)
-        e.source_span = _translate_span(self.positions, self.start, self.end)
-        syntax_spans = e._syntax_spans(self.match)
-        if self.positions is not None and syntax_spans:
-            translated = []
-            for start, end in syntax_spans:
-                span = _translate_span(self.positions, start, end)
-                if span is not None:
-                    translated.append(span)
-            e.syntax_spans = translated
-        e._set_extra_source_spans(self.match, self.positions)
+        if self.positions is not None:
+            self._attach_location(e)
+        try:
+            e._set_extra_source_spans(self.match, self.positions)
+        except Exception:
+            # An extension hook failing must never break parsing; the element
+            # keeps whatever positions were already attached.
+            pass
         if e.parse_children:
             self.children = _resolve_overlap(self.children)
             e.children = make_elements(
@@ -202,6 +220,48 @@ class Token:
                 self.positions,
             )
         return e
+
+    def _attach_location(self, element: InlineElement) -> None:
+        """Translate match/syntax spans through the content map with graceful
+        fallback: a third-party element that cannot describe its spans still
+        receives the outer span whenever that is computable."""
+        positions = self.positions
+        assert positions is not None
+        try:
+            outer = positions.translate(self.start, self.end)
+        except Exception:
+            outer = None
+        syntax: tuple[Span, ...] | None = None
+        try:
+            syntax_spans = element._syntax_spans(self.match)
+        except Exception:
+            syntax_spans = None
+        if syntax_spans:
+            translated = []
+            for start, end in syntax_spans:
+                try:
+                    span = positions.translate(start, end)
+                except Exception:
+                    span = None
+                if span is not None:
+                    translated.append(span)
+            syntax = tuple(translated)
+        elif syntax_spans == []:
+            syntax = ()
+        content = None
+        if element.parse_children and self.inner_end > self.inner_start:
+            try:
+                content = positions.slice_map(self.inner_start, self.inner_end)
+            except Exception:
+                content = None
+        try:
+            element.span_info = make_location(outer, content, syntax)
+        except Exception:
+            if outer is not None:
+                try:
+                    element.source_span = outer
+                except Exception:
+                    pass
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__}: {self.etype.__name__} start={self.start} end={self.end}>"

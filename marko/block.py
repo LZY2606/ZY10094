@@ -5,13 +5,14 @@ Block level elements
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from re import Match
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from . import inline, inline_parser, patterns
-from .element import Element, _SourceMap
+from .element import Element
 from .helpers import find_next, normalize_label, partition_by_spaces
+from .span import SourceMap, Span, make_location
 
 if TYPE_CHECKING:
     from .source import Source
@@ -71,6 +72,19 @@ class BlockElement(Element):
         """
         raise NotImplementedError()
 
+    @classmethod
+    def finalize_location(
+        cls, element: BlockElement, result: Any, source: Source
+    ) -> None:
+        """Attach source position information after the element is built.
+
+        ``result`` is whatever :meth:`parse` returned (either the element
+        itself or the constructor argument).  The default does nothing; the
+        parser assigns the outer span afterwards.  Subclasses with an inline
+        body (e.g. :class:`Heading`) override this to provide the content map.
+        Called only when source maps are enabled.
+        """
+
     def __lt__(self, o: BlockElement) -> bool:
         return self.priority < o.priority
 
@@ -86,27 +100,63 @@ class Document(BlockElement):
         self.link_ref_defs: dict[str, tuple[str, str]] = {}
 
 
-class _ParsedLines(list[str]):
-    """Paragraph lines with their prefix-aware source offsets."""
+def attach_location(
+    element: Element,
+    source: Source,
+    *,
+    source_span: tuple[int, int] | None = None,
+    content: SourceMap | None = None,
+    syntax_spans: Iterable[tuple[int, int]] | None = None,
+) -> None:
+    """Attach the unified :class:`~marko.span.Location` of ``element``.
 
-    def __init__(self, lines: Sequence[str], line_starts: Sequence[int]) -> None:
-        super().__init__(lines)
-        self.line_starts = list(line_starts)
+    Only the provided fields are written; ``source`` is accepted for symmetry
+    with the block parse hooks and to honor the source-map switch.
+    """
+    del source  # the switch is checked by the callers
+    location = element.span_info
+    spans = location.syntax_spans
+    if syntax_spans is not None:
+        spans = tuple(
+            item if isinstance(item, Span) else Span(item[0], item[1])
+            for item in syntax_spans
+        )
+    element.span_info = make_location(
+        Span(*source_span) if source_span is not None else location.source_span,
+        content if content is not None else location.content,
+        spans,
+        location.raw,
+    )
 
 
-def _build_inline_positions(
-    lines: Sequence[str], line_starts: Sequence[int]
-) -> _SourceMap:
-    """Build a parallel mapping from the indices of the inline body
-    (i.e. the lines with leading whitespace stripped and joined) to the
-    positions in the source text.
+def build_content_map(lines: Sequence[str], line_starts: Sequence[int]) -> SourceMap:
+    """Map the inline body (lines with leading whitespace stripped and joined)
+    back to its discontinuous runs in the normalized source text.
+
+    Newlines that join the lines are not part of the inline content and are
+    therefore skipped, producing one compact run per non-empty line.
     """
     runs: list[tuple[int, int]] = []
     for line, base in zip(lines, line_starts):
         stripped = line.lstrip()
-        leading = len(line) - len(stripped)
-        runs.append((base + leading, len(stripped)))
-    return _SourceMap(runs)
+        if stripped:
+            leading = len(line) - len(stripped)
+            runs.append((base + leading, len(stripped)))
+    return SourceMap(runs)
+
+
+class _ParsedLines(list[str]):
+    """Paragraph lines, optionally with their prefix-aware source offsets.
+
+    ``line_starts`` is ``None`` when source maps are disabled, in which case
+    no position storage is allocated.
+    """
+
+    line_starts: list[int] | None
+
+    def __init__(self, lines: Sequence[str], line_starts: Sequence[int] | None) -> None:
+        super().__init__(lines)
+        self.line_starts = None if line_starts is None else list(line_starts)
 
 
 class BlankLine(BlockElement):
@@ -144,6 +194,15 @@ class Heading(BlockElement):
     def __init__(self, match: Match[str]) -> None:
         self.level = len(match.group(1))
         self.inline_body = match.group(2).strip()
+
+    @classmethod
+    def finalize_location(
+        cls, element: BlockElement, result: Any, source: Source
+    ) -> None:
+        if not source.sourcemap_enabled:
+            return
+        heading = cast("Heading", element)
+        match = cast(Match[str], result)
         group = match.group(2)
         start = match.start(2)
         a = 0
@@ -152,7 +211,12 @@ class Heading(BlockElement):
         b = len(group)
         while b > a and group[b - 1].isspace():
             b -= 1
-        self._inline_positions = _SourceMap([(start + a, b - a)])
+        if b > a:
+            attach_location(
+                heading,
+                source,
+                content=SourceMap.contiguous(start + a, b - a),
+            )
 
     @classmethod
     def match(cls, source: Source) -> Match[str] | None:
@@ -179,9 +243,9 @@ class SetextHeading(BlockElement):
         self.level = 1 if underline.strip()[0] == "=" else 2
         self.inline_body = "".join(line.lstrip() for line in lines).strip()
         if line_starts is not None:
-            self._inline_positions = _build_inline_positions(
-                lines, line_starts[: len(lines)]
-            )[: len(self.inline_body)]
+            body_length = len(self.inline_body)
+            content = build_content_map(lines, line_starts[: len(lines)])
+            self._inline_positions = content.slice_map(0, body_length)
 
 
 class CodeBlock(BlockElement):
@@ -390,9 +454,9 @@ class Paragraph(BlockElement):
         self._tight = False
         line_starts = getattr(lines, "line_starts", None)
         if line_starts is not None:
-            self._inline_positions = _build_inline_positions(lines, line_starts)[
-                : len(str_lines)
-            ]
+            self._inline_positions = build_content_map(lines, line_starts).slice_map(
+                0, len(str_lines)
+            )
 
     @classmethod
     def match(cls, source: Source) -> bool:
@@ -440,9 +504,10 @@ class Paragraph(BlockElement):
     def parse(cls, source: Source) -> list[str] | SetextHeading:
         first_line = source.next_line()
         assert first_line is not None
+        track = source.sourcemap_enabled
         lines = _ParsedLines(
             [first_line],
-            [source.match.start() if source.match else source.pos],
+            [source.match.start() if source.match else source.pos] if track else None,
         )
         source.consume()
         end_parse = False
@@ -453,9 +518,10 @@ class Paragraph(BlockElement):
             # the prefix is matched and not breakers
             if line:
                 lines.append(line)
-                lines.line_starts.append(
-                    source.match.start() if source.match else source.pos
-                )
+                if track and lines.line_starts is not None:
+                    lines.line_starts.append(
+                        source.match.start() if source.match else source.pos
+                    )
                 source.consume()
                 if cls.is_setext_heading(line):
                     return cast(
@@ -475,13 +541,69 @@ class Paragraph(BlockElement):
                             end_parse = True
                         else:
                             lines.append(next_line)
-                            lines.line_starts.append(
-                                source.match.start() if source.match else source.pos
-                            )
+                            if track and lines.line_starts is not None:
+                                lines.line_starts.append(
+                                    source.match.start() if source.match else source.pos
+                                )
                             source.consume()
                         break
                 source._states = states
         return lines
+
+
+_QUOTE_CHAIN_RE = re.compile(r"(?: {0,3}>[^\n\S]?)*")
+_QUOTE_GT_RE = re.compile(r">")
+_LIST_BULLET_RE = re.compile(r" {0,3}(?:\d{1,9}[.)]|[*\-+])", re.MULTILINE)
+_LINE_RE = re.compile(r"(?m)[^\n]*\n?")
+
+
+def _line_quote_markers(text: str, line_start: int, line_end: int) -> list[int]:
+    """Offsets of the ``>`` characters in the leading quote chain of a line."""
+    chain = _QUOTE_CHAIN_RE.match(text, line_start, line_end)
+    if chain is None:
+        return []
+    return [m.start() for m in _QUOTE_GT_RE.finditer(text, chain.start(), chain.end())]
+
+
+def _collect_quote_markers(
+    source: Source, start: int, end: int
+) -> list[tuple[int, int]]:
+    """Collect the ``>`` markers belonging to this quote level.
+
+    Each line may open with a chain of nested quote markers
+    (``> > > ...``).  The chain on the first line determines this quote's
+    nesting index from its start offset; the marker at that same index on
+    every later line belongs to this quote.  Lazy continuation lines without
+    a marker chain (or a shorter one) contribute nothing, which yields a
+    genuinely discontinuous syntax set.
+    """
+    text = source._buffer
+    first_line_end = text.find("\n", start) + 1 or end
+    first_markers = _line_quote_markers(text, start, first_line_end)
+    # ``start`` sits right after this quote's own marker; count the chain
+    # markers at or before it (i.e. the ancestors plus this quote, minus one).
+    depth = sum(1 for offset in first_markers if offset < start)
+    markers: list[tuple[int, int]] = []
+    line_start = start
+    while line_start < end:
+        line_end = text.find("\n", line_start)
+        line_end = end if line_end < 0 else min(line_end + 1, end)
+        chain = _line_quote_markers(text, line_start, line_end)
+        if depth < len(chain):
+            offset = chain[depth]
+            markers.append((offset, offset + 1))
+        line_start = line_end
+    return markers
+
+
+def _list_item_marker_span(
+    source: Source, item_start: int, item: ListItem
+) -> list[tuple[int, int]]:
+    """The bullet/ordering marker of a list item, excluding child markers."""
+    match = _LIST_BULLET_RE.match(source._buffer, item_start)
+    if match is None or match.start() != item_start:
+        return []
+    return [(match.start(), match.end())]
 
 
 class Quote(BlockElement):
@@ -498,8 +620,16 @@ class Quote(BlockElement):
     @classmethod
     def parse(cls, source: Source) -> Quote:
         state = cls()
+        quote_start = source._current_pos
         with source.under_state(state):
             state.children = source.parser.parse_source(source)
+        if source.sourcemap_enabled:
+            attach_location(
+                state,
+                source,
+                source_span=(quote_start, source.pos),
+                syntax_spans=_collect_quote_markers(source, quote_start, source.pos),
+            )
         return state
 
 
@@ -547,7 +677,13 @@ class List(BlockElement):
                         el = cast("type[ListItem]", parser.block_elements["ListItem"])(
                             el
                         )
-                    el.source_span = (item_start, source.pos)
+                    if source.sourcemap_enabled:
+                        attach_location(
+                            el,
+                            source,
+                            source_span=(item_start, source.pos),
+                            syntax_spans=_list_item_marker_span(source, item_start, el),
+                        )
                     children.append(el)
                     source.anchor()
                     if has_blank_line:

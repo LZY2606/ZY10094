@@ -5,10 +5,10 @@ Base parser
 from __future__ import annotations
 
 import itertools
-from collections.abc import Sequence
 from typing import TYPE_CHECKING, cast
 
 from .source import Source
+from .span import SourceMap, Span, make_location
 
 
 class Parser:
@@ -23,7 +23,9 @@ class Parser:
     :param \*extras: extra elements to be included in parsing process.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, sourcemap: bool = True) -> None:
+        #: When False, no position information is allocated during parsing.
+        self.sourcemap = sourcemap
         self.block_elements: dict[str, BlockElementType] = {}
         self.inline_elements: dict[str, InlineElementType] = {}
 
@@ -59,10 +61,16 @@ class Parser:
         :param text: the text to parse.
         :returns: the parsed root element
         """
-        source = Source(text)
+        source = Source(text, sourcemap=self.sourcemap)
         source.parser = self
         doc = cast(block.Document, self.block_elements["Document"]())
-        doc.source_span = (0, len(source._buffer))
+        if self.sourcemap:
+            doc.span_info = make_location(
+                Span(0, len(source._buffer)),
+                None,
+                None,
+                source.newline_map,
+            )
         with source.under_state(doc):
             doc.children = self.parse_source(source)
             self.parse_inline(doc, source)
@@ -76,14 +84,18 @@ class Parser:
             start = source._current_pos
             for ele_type in element_list:
                 if ele_type.match(source):
-                    result = ele_type.parse(source)
+                    parsed = ele_type.parse(source)
                     end = source.pos
-                    if not hasattr(result, "priority"):
+                    if not hasattr(parsed, "priority"):
                         # In some cases ``parse()`` won't return the element, but
                         # instead some information to create one, which will be passed
                         # to ``__init__()``.
-                        result = ele_type(result)  # type: ignore
-                    if result.source_span is None:
+                        result = ele_type(parsed)  # type: ignore
+                        ele_type.finalize_location(result, parsed, source)
+                    else:
+                        result = parsed
+                        ele_type.finalize_location(result, parsed, source)
+                    if self.sourcemap and result.source_span is None:
                         result.source_span = (start, end)
                     ast.append(result)
                     break
@@ -97,12 +109,14 @@ class Parser:
         are seen before that.
         """
         if element.inline_body:
+            positions = element._inline_positions if self.sourcemap else None
             element.children = self._parse_inline(
                 element.inline_body,
                 source,
-                positions=element._inline_positions,
+                positions=positions,
             )
-            # clear the inline body to avoid parsing it again.
+            # clear the inline body and the temporary content map; the
+            # content is reconstructable from the children afterwards.
             element.inline_body = ""
             element._inline_positions = None
         else:
@@ -114,7 +128,7 @@ class Parser:
         self,
         text: str,
         source: Source,
-        positions: Sequence[int] | None = None,
+        positions: SourceMap | None = None,
     ) -> list[inline.InlineElement]:
         """Parses text into inline elements.
         RawText is not considered in parsing but created as a wrapper of holes

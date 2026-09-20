@@ -53,10 +53,13 @@ class Markdown:
         parser: type[Parser] = Parser,
         renderer: type[Renderer] = HTMLRenderer,
         extensions: Iterable[str | MarkoExtension] | None = None,
+        sourcemap: bool = True,
     ) -> None:
         if not issubclass(parser, Parser):
             raise TypeError("parser must be a subclass of Parser.")
         self._base_parser = parser
+        #: Whether parsed elements carry source position information.
+        self.sourcemap = sourcemap
         self._parser_mixins: list[type] = []
 
         if not issubclass(renderer, Renderer):
@@ -94,10 +97,15 @@ class Markdown:
         """Install all extensions and set things up."""
         if self._setup_done:
             return
-        self.parser = cast(
-            Parser,
-            type("_Parser", tuple(self._parser_mixins) + (self._base_parser,), {})(),
+        parser_cls = type(
+            "_Parser", tuple(self._parser_mixins) + (self._base_parser,), {}
         )
+        try:
+            self.parser = cast(Parser, parser_cls(sourcemap=self.sourcemap))
+        except TypeError:
+            # Allow third-party Parser subclasses with the legacy signature.
+            self.parser = cast(Parser, parser_cls())
+            self.parser.sourcemap = self.sourcemap
         for e in self._extra_elements:
             self.parser.add_element(e)
         self.renderer = cast(

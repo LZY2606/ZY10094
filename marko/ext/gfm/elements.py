@@ -9,8 +9,8 @@ import re
 from typing import Any, cast
 
 from marko import block, inline
-from marko.element import _SourceMap
 from marko.source import Source
+from marko.span import SourceMap, Span, make_location
 
 
 class Paragraph(block.Paragraph):
@@ -24,7 +24,9 @@ class Paragraph(block.Paragraph):
             self.checked = m.group(1)[1:-1].lower() == "x"
             self.inline_body = self.inline_body[m.end(1) :]
             if self._inline_positions is not None:
-                self._inline_positions = self._inline_positions[m.end(1) :]
+                self._inline_positions = self._inline_positions.slice_map(
+                    m.end(1)
+                )
 
 
 class Strikethrough(inline.InlineElement):
@@ -126,7 +128,7 @@ class Table(block.BlockElement):
         source.anchor()
         if not TableRow.match(source) or source.context.is_delimiter:
             return False
-        head_span = source.context.row_span
+        head_span = source.context.row_span if source.sourcemap_enabled else None
         if TableRow.splitter.search(source.next_line()) is None:
             return False
         # consume the first row, we don't use source.consume() here
@@ -138,7 +140,8 @@ class Table(block.BlockElement):
                 for cell, start in zip(source.context.cells, source.context.cell_starts)
             ]
         )
-        head.source_span = head_span
+        if head_span is not None:
+            head.source_span = head_span
         if (
             not TableRow.match(source)
             or not source.context.is_delimiter
@@ -150,14 +153,16 @@ class Table(block.BlockElement):
             "children": [head],
             "delimiters": source.context.cells,
         }
-        source.context.table_start = table_start
+        if source.sourcemap_enabled:
+            source.context.table_start = table_start
         source.consume()  # consume the second row
         return True
 
     @classmethod
     def parse(cls, source):
         rv = cls(**source.context.table_info)
-        table_start = source.context.table_start
+        if source.sourcemap_enabled:
+            table_start = source.context.table_start
         with source.under_state(rv):
             for d, th in zip(rv.delimiters, rv.head.children):
                 stripped_d = d.strip()
@@ -179,7 +184,8 @@ class Table(block.BlockElement):
                         rv.children.append(TableRow.parse(source))
                         continue
                 break
-        rv.source_span = (table_start, source.pos)
+        if source.sourcemap_enabled:
+            rv.source_span = (table_start, source.pos)
         return rv
 
 
@@ -198,8 +204,10 @@ class TableRow(block.BlockElement):
         line = source.next_line()
         if not line or not re.match(r" {,3}\S", line):
             return False
+        track = source.sourcemap_enabled
         line_start = source.match.start() if source.match else source.pos
-        source.context.row_span = (line_start, line_start + len(line))
+        if track:
+            source.context.row_span = (line_start, line_start + len(line))
         stripped = line.strip()
         leading = len(line) - len(line.lstrip())
         parts = []
@@ -207,20 +215,24 @@ class TableRow(block.BlockElement):
         last = 0
         for m in cls.splitter.finditer(stripped):
             parts.append(stripped[last : m.start()])
-            starts.append(line_start + leading + last)
+            if track:
+                starts.append(line_start + leading + last)
             last = m.end()
         parts.append(stripped[last:])
-        starts.append(line_start + leading + last)
+        if track:
+            starts.append(line_start + leading + last)
         if parts and not parts[0]:
             parts.pop(0)
-            starts.pop(0)
+            if track:
+                starts.pop(0)
         if parts and not parts[-1]:
             parts.pop()
-            starts.pop()
+            if track:
+                starts.pop()
         if len(parts) < 1:
             return False
         source.context.cells = parts
-        source.context.cell_starts = starts
+        source.context.cell_starts = starts if track else [None] * len(parts)
         source.context.is_delimiter = all(cls.delimiter.match(cell) for cell in parts)
         return True
 
@@ -241,7 +253,8 @@ class TableRow(block.BlockElement):
         for head, cell in zip(parent.head.children, cell_elements):
             cell.align = cast(TableCell, head).align
         rv = cls(cell_elements)
-        rv.source_span = source.context.row_span
+        if source.sourcemap_enabled:
+            rv.source_span = source.context.row_span
         return rv
 
 
@@ -256,9 +269,8 @@ class TableCell(block.BlockElement):
         self.header = False
         self.align: str | None = None
         if position is not None:
-            self.source_span = (position, position + len(text))
             pos = position + (len(text) - len(text.lstrip()))
-            self._inline_positions = _SourceMap.from_positions(
+            content = SourceMap.from_positions(
                 pos + i
                 for i in range(len(stripped))
                 if not (
@@ -266,6 +278,9 @@ class TableCell(block.BlockElement):
                     and i + 1 < len(stripped)
                     and stripped[i + 1] == "|"
                 )
+            )
+            self.span_info = make_location(
+                Span(position, position + len(text)), content, None
             )
 
 
